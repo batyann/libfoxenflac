@@ -15,6 +15,13 @@ files).
 This library is perfect for environments without runtime library, such as
 embedded devices or Web Assembly (WASM).
 
+This fork is meant to improve the CPU usage and lower the memory requirements
+for embedded systems such as the target it's currently running on, an ARM
+Cortex M4 clocked @96MHz with only 192kB of RAM. The changes made to achieve
+this goal assume the input files are 48kHz max, 16bps max, 2 channels max.
+The memory needed for the internal buffer had been reduced from ~36.5kB to
+~18.5kB mainly by changing `blkbuf` from `int32_t` to `int16_t`
+
 ## Features
 
 * **Small footprint**. Zero dependencies on the C runtime (runs on bare metal)
