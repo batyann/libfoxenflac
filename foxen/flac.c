@@ -16,14 +16,19 @@
  *  along with this program.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+#if 0
 #include <assert.h>
+#else
+#include <common.h>
+#define assert ASSERT
+#endif
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
 #include <foxen/flac.h>
 
-#if 0
+#if 1
 /* Set FX_FLAC_NO_CRC if you control the input data and already performed other
    integrity checks. This makes the decoder significantly faster. */
 #define FX_FLAC_NO_CRC
@@ -114,7 +119,7 @@ static inline void fx_bitstream_set_source(fx_bitstream_t *reader,
  */
 static inline bool fx_bitstream_can_read(fx_bitstream_t *reader,
                                          uint8_t n_bits) {
-	return (sizeof(reader->buf) * 8U) >= (n_bits + reader->pos);
+	return (sizeof(reader->buf) * 8U) >= ((unsigned)n_bits + reader->pos);
 }
 
 /**
@@ -179,7 +184,7 @@ static inline uint64_t fx_bitstream_peek_msb(fx_bitstream_t *reader,
  */
 static inline int64_t fx_bitstream_try_read_msb(fx_bitstream_t *reader,
                                                 uint8_t n_bits) {
-	return fx_bitstream_can_read(reader, n_bits)
+	return likely(fx_bitstream_can_read(reader, n_bits))
 	           ? (int64_t)fx_bitstream_read_msb(reader, n_bits)
 	           : -1;
 }
@@ -824,7 +829,7 @@ struct fx_flac {
 	/**
 	 * Structure holding the temporary/output buffers for each channel.
 	 */
-	int32_t *blkbuf[FLAC_MAX_CHANNEL_COUNT];
+	int32_t *blkbuf;
 };
 
 /******************************************************************************
@@ -893,39 +898,9 @@ static bool _fx_flac_decode_channel_count(
  * Decoding functions                                                         *
  ******************************************************************************/
 
-static inline void _fx_flac_post_process_left_side(int32_t *blk1, int32_t *blk2,
-                                                   uint32_t blk_size) {
-	blk1 = (int32_t *)FX_ASSUME_ALIGNED(blk1);
-	blk2 = (int32_t *)FX_ASSUME_ALIGNED(blk2);
-	for (uint32_t i = 0U; i < blk_size; i++) {
-		blk2[i] = blk1[i] - blk2[i];
-	}
-}
-
-static inline void _fx_flac_post_process_right_side(int32_t *blk1,
-                                                    int32_t *blk2,
-                                                    uint32_t blk_size) {
-	blk1 = (int32_t *)FX_ASSUME_ALIGNED(blk1);
-	blk2 = (int32_t *)FX_ASSUME_ALIGNED(blk2);
-	for (uint32_t i = 0U; i < blk_size; i++) {
-		blk1[i] = blk1[i] + blk2[i];
-	}
-}
-
-static inline void _fx_flac_post_process_mid_side(int32_t *blk1, int32_t *blk2,
-                                                  uint32_t blk_size) {
-	blk1 = (int32_t *)FX_ASSUME_ALIGNED(blk1);
-	blk2 = (int32_t *)FX_ASSUME_ALIGNED(blk2);
-	for (uint32_t i = 0U; i < blk_size; i++) {
-		/* Code libflac from stream_decoder.c */
-		int32_t mid = blk1[i];
-		int32_t side = blk2[i];
-		mid = ((uint32_t)mid) << 1;
-		mid |= (side & 1); /* Round correctly */
-		blk1[i] = (mid + side) >> 1;
-		blk2[i] = (mid - side) >> 1;
-	}
-}
+#pragma GCC optimize("O2")
+#define WINSIZE 16UL
+#define WINIDX(x) ((x) & (WINSIZE - 1UL))
 
 static inline void _fx_flac_restore_lpc_signal(int32_t *blk, uint32_t blk_size,
                                                int32_t *lpc_coeffs,
@@ -934,13 +909,13 @@ static inline void _fx_flac_restore_lpc_signal(int32_t *blk, uint32_t blk_size,
 	blk = (int32_t *)FX_ASSUME_ALIGNED(blk);
 	lpc_coeffs = (int32_t *)FX_ASSUME_ALIGNED(lpc_coeffs);
 
-	for (uint32_t i = lpc_order; i < blk_size; i++) {
-		int64_t accu = 0;
-		for (uint8_t j = 0; j < lpc_order; j++) {
-			accu += (int64_t)lpc_coeffs[j] * (int64_t)blk[i - j - 1];
-		}
-		blk[i] = blk[i] + (accu >> lpc_shift);
-	}
+   for (uint32_t i = lpc_order; i < blk_size; i++) {
+      int64_t accu = 0;
+      for (unsigned j = 0; j < lpc_order; j++) {
+         accu += (int64_t)lpc_coeffs[j] * (int64_t)blk[i - j - 1];
+      }
+      blk[i] = blk[i] + (accu >> lpc_shift);
+   }
 }
 
 /******************************************************************************
@@ -958,7 +933,7 @@ static inline void _fx_flac_restore_lpc_signal(int32_t *blk, uint32_t blk_size,
 
 #define READ_BITS(n)                                         \
 	(tmp_ = fx_bitstream_try_read_msb(&inst->bitstream, n)); \
-	if (tmp_ < 0) {                                          \
+	if (unlikely(tmp_ < 0)) {                                          \
 		return false; /* Need more data */                   \
 	}
 
@@ -1105,11 +1080,15 @@ static bool _fx_flac_reader_utf8_coded_int(fx_flac_t *inst, uint8_t max_n,
 	uint8_t v = READ_BITS_FAST_DCRC(8U);
 
 	/* Count the number of ones in the first byte */
+#if 1
 	uint8_t n_ones = 0U;
 	while (v & 0x80U) {
 		v = v << 1U;
 		n_ones++;
 	}
+#else
+   uint8_t n_ones = __builtin_clz(~((uint32_t)v << 24));
+#endif
 
 	/* Abort if the number of bytes to read is larger than max_n */
 	if (n_ones > max_n) {
@@ -1426,12 +1405,106 @@ static bool _fx_flac_process_search_frame(fx_flac_t *inst) {
 	return true;
 }
 
-static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
-	int64_t tmp_; /* Used by the READ_BITS macro */
+struct push_p {
+   uint8_t lpc_order;
+   int8_t lpc_shift;
+   bool constant;
+};
+
+static int32_t _fx_data_push_chan1_p(uint32_t idx, int32_t val,
+                                      int32_t*lpc_coeffs, struct push_p const p)
+{
+   /* assert(p.lpc_order <= WINSIZE); */
+   int64_t accu = 0;
+   static int32_t blk_win[WINSIZE];
+
+   /* TODO: p.constant does not seem to make a difference */
+   if (/* !p.constant && */ idx >= p.lpc_order) {
+      for (uint32_t j = 0; j < p.lpc_order; j++) {
+         accu += (int64_t)lpc_coeffs[j] * (int64_t)blk_win[WINIDX(idx - j - 1)];
+      }
+   }
+
+   const int32_t v1 = val + (accu >> p.lpc_shift);
+   blk_win[WINIDX(idx)] = v1;
+
+   return v1;
+}
+
+static void _fx_data_push_chan1_l(int32_t*blk, uint32_t idx, int32_t val,
+                                  int32_t*lpc_coeffs, struct push_p const p)
+{
+   const int32_t v0 = blk[idx];
+   const int32_t v1 = _fx_data_push_chan1_p(idx, val, lpc_coeffs, p);
+   audio_t*out = (audio_t*)&blk[idx];
+   out[0] = v0;
+   out[1] = v0 - v1;
+}
+
+static void _fx_data_push_chan1_r(int32_t*blk, uint32_t idx, int32_t val,
+                                  int32_t*lpc_coeffs, struct push_p const p)
+{
+   const int32_t v0 = blk[idx];
+   const int32_t v1 = _fx_data_push_chan1_p(idx, val, lpc_coeffs, p);
+   audio_t*out = (audio_t*)&blk[idx];
+   out[0] = v0 + v1;
+   out[1] = v1;
+}
+
+static void _fx_data_push_chan1_x(int32_t*blk, uint32_t idx, int32_t val,
+                                  int32_t*lpc_coeffs, struct push_p const p)
+{
+   const int32_t v0 = blk[idx];
+   const int32_t v1 = _fx_data_push_chan1_p(idx, val, lpc_coeffs, p);
+   audio_t*out = (audio_t*)&blk[idx];
+   out[0] = v0;
+   out[1] = v1;
+}
+
+static void _fx_data_push_chan1_m(int32_t*blk, uint32_t idx, int32_t val,
+                                  int32_t*lpc_coeffs, struct push_p const p)
+{
+   const int32_t v0 = blk[idx];
+   const int32_t v1 = _fx_data_push_chan1_p(idx, val, lpc_coeffs, p);
+   int32_t mid = v0;
+   int32_t side = v1;
+   audio_t*out = (audio_t*)&blk[idx];
+   mid = ((uint32_t)mid) << 1;
+   mid |= (side & 1); /* Round correctly */
+   out[0] = (mid + side) >> 1;
+   out[1] = (mid - side) >> 1;
+}
+
+static bool _fx_flac_process_in_frame(fx_flac_t *inst)
+{
+	int64_t tmp_ = 0; /* Used by the READ_BITS macro */
 	fx_flac_frame_header_t *fh = inst->frame_header;
 	fx_flac_subframe_header_t *sfh = inst->subframe_header;
-	int32_t *blk = inst->blkbuf[inst->chan_cur % FLAC_MAX_CHANNEL_COUNT];
+	int32_t *blk = inst->blkbuf;
 	const uint32_t blk_n = fh->block_size;
+
+   void(*fx_data_push)(int32_t*, uint32_t, int32_t,
+                       int32_t*, struct push_p const p) = NULL;
+
+   struct push_p const p = { .lpc_shift = sfh->lpc_shift,
+                             .lpc_order = sfh->order,
+                             .constant  = SFT_CONSTANT == sfh->type };
+
+   if (1 == inst->chan_cur) {
+      switch (fh->channel_assignment) {
+      case LEFT_SIDE_STEREO : fx_data_push = _fx_data_push_chan1_l; break;
+      case RIGHT_SIDE_STEREO: fx_data_push = _fx_data_push_chan1_r; break;
+      case MID_SIDE_STEREO  : fx_data_push = _fx_data_push_chan1_m; break;
+      default               : fx_data_push = _fx_data_push_chan1_x; break;
+      }
+   }
+
+   #define _FX_DATA_PUSH(idx, val)                       \
+   if (0 == inst->chan_cur) {                            \
+      blk[idx] = val;                                    \
+   } else {                                              \
+      fx_data_push(blk, idx, val, sfh->lpc_coeffs, p);   \
+   }
 
 	/* Figure out the number of bits to read for sample. This depends on the
 	   channel assignment. */
@@ -1443,7 +1516,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 	}
 
 	/* Discard frames with invalid bits per sample values */
-	if (bps == 0U || bps > 32U) {
+	if (unlikely(bps == 0U || bps > 32U)) {
 		return _fx_flac_handle_err(inst);
 	}
 
@@ -1456,7 +1529,9 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			/* Reset the block write cursor, make sure initial blk sample is set
 			   to zero for zero-order fixed LPC */
 			inst->blk_cur = 0U;
-			blk[0U] = 0U;
+      #if 0 /* TODO FIXME */
+			blk[0U] = 0U; /* FX_DATA_PUSH */
+      #endif
 
 			/* Read a zero padding bit. This must be zero. */
 			uint8_t padding = READ_BITS_FAST_CRC(1U);
@@ -1515,11 +1590,11 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 		case FLAC_SUBFRAME_CONSTANT: {
 			/* Read a single sample value and spread it over the entire block
 			   buffer for this subframe. */
-			blk[0U] = READ_BITS_CRC(bps);
-			blk[0U] = SIGN_EXTEND(blk[0U], bps);
-			for (uint16_t i = 1U; i < blk_n; i++) {
-				blk[i] = blk[0U];
-			}
+         int32_t v = READ_BITS_CRC(bps);
+         v = SIGN_EXTEND(v, bps);
+			for (uint16_t i = 0; i < blk_n; i++) {
+            _FX_DATA_PUSH(i, v);
+         }
 			inst->priv_state = FLAC_SUBFRAME_FINALIZE;
 			break;
 		}
@@ -1528,9 +1603,10 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 		case FLAC_SUBFRAME_LPC: {
 			/* Either just read up to "order" samples, or the entire block */
 			const uint32_t n = (sfh->type == SFT_VERBATIM) ? blk_n : sfh->order;
+
 			while (inst->blk_cur < n) {
-				blk[inst->blk_cur] = READ_BITS_CRC(bps);
-				blk[inst->blk_cur] = SIGN_EXTEND(blk[inst->blk_cur], bps);
+            int32_t const v = READ_BITS_CRC(bps); /* Note: bps may be e.g. 17 ! */
+            _FX_DATA_PUSH(inst->blk_cur, SIGN_EXTEND(v, bps));
 				inst->blk_cur++;
 			}
 			inst->priv_state =
@@ -1617,6 +1693,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			while (inst->partition_sample > 0U) {
 				/* Read the unary part of the Rice encoded sample bit-by-bit */
 				if (inst->priv_state == FLAC_SUBFRAME_RICE_UNARY) {
+            #if !defined(FX_FLAC_NO_CRC)
 					while (true) {
 						const uint8_t bit = READ_BITS_CRC(1U);
 						if (bit) {
@@ -1624,6 +1701,24 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 						}
 						inst->rice_unary_counter++;
 					}
+            #else
+               fx_bitstream_t *const reader = &inst->bitstream;
+               if (unlikely(BUFSIZE == reader->pos)) {
+                  return false;
+               }
+               while (unlikely(0 == (reader->buf << reader->pos))) {
+                  inst->rice_unary_counter += BUFSIZE - reader->pos;
+                  reader->pos = BUFSIZE;
+                  _fx_bitstream_fill_buf(reader);
+                  if (unlikely(BUFSIZE == reader->pos)) {
+                     return false;
+                  }
+               }
+               unsigned const clz = __builtin_clzll(reader->buf << reader->pos);
+               inst->rice_unary_counter += clz;
+               reader->pos += clz + 1;
+               _fx_bitstream_fill_buf(reader);
+            #endif
 				}
 
 				/* If there are no more bits left below, make sure we end up
@@ -1639,11 +1734,8 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 				const uint32_t val = (q << sfh->rice_parameter) | r;
 
 				/* Last bit determines sign */
-				if (val & 1) {
-					blk[inst->blk_cur] = -((int32_t)(val >> 1)) - 1;
-				} else {
-					blk[inst->blk_cur] = (int32_t)(val >> 1);
-				}
+            const int32_t v = (val & 1) ? -((int32_t)(val >> 1)) - 1 : (int32_t)(val >> 1);
+            _FX_DATA_PUSH(inst->blk_cur, v);
 
 				/* Read the next sample */
 				inst->rice_unary_counter = 0U;
@@ -1655,10 +1747,10 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			break;
 		case FLAC_SUBFRAME_RICE_VERBATIM: {
 			/* Samples are encoded in verbatim in this partition */
-			const uint8_t bps = sfh->rice_parameter;
+			const uint8_t bps_ = sfh->rice_parameter;
 			while (inst->partition_sample > 0U) {
-				blk[inst->blk_cur] = (bps == 0) ? 0U : READ_BITS_CRC(bps);
-				blk[inst->blk_cur] = SIGN_EXTEND(blk[inst->blk_cur], bps);
+            int32_t v = (bps_ == 0) ? 0U : READ_BITS_CRC(bps_);
+            _FX_DATA_PUSH(inst->blk_cur, SIGN_EXTEND(v, bps_));
 				inst->blk_cur++;
 				inst->partition_sample--;
 			}
@@ -1669,15 +1761,18 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			/* Go to the next partition or finalize this subframe */
 			inst->partition_cur++;
 			if (inst->partition_cur == (1U << sfh->rice_partition_order)) {
-				/* Decode the residual */
-				_fx_flac_restore_lpc_signal(blk, blk_n, sfh->lpc_coeffs,
-				                            sfh->order, sfh->lpc_shift);
+				/* Decode the residual for channel#0 */
+            if (0 == inst->chan_cur) {
+               _fx_flac_restore_lpc_signal(inst->blkbuf, blk_n, sfh->lpc_coeffs,
+                                           sfh->order, sfh->lpc_shift);
+            }
 				inst->priv_state = FLAC_SUBFRAME_FINALIZE;
 			} else {
 				inst->priv_state = FLAC_SUBFRAME_RICE_INIT;
 			}
 			break;
 		case FLAC_SUBFRAME_FINALIZE: {
+      #if 0
 			/* Apply the wasted bits transformation */
 			if (sfh->wasted_bits) {
 				uint8_t shift = sfh->wasted_bits;
@@ -1685,6 +1780,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 					blk[i] = blk[i] * (1 << shift);
 				}
 			}
+      #endif
 
 			/* There is another subframe to read, continue! */
 			inst->chan_cur++; /* Go to the next channel */
@@ -1706,22 +1802,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 			(void)crc16;
 #endif
 
-			/* Post process side-stereo */
-			int32_t *c1 = inst->blkbuf[0], *c2 = inst->blkbuf[1];
-			switch (fh->channel_assignment) {
-				case LEFT_SIDE_STEREO:
-					_fx_flac_post_process_left_side(c1, c2, blk_n);
-					break;
-				case RIGHT_SIDE_STEREO:
-					_fx_flac_post_process_right_side(c1, c2, blk_n);
-					break;
-				case MID_SIDE_STEREO:
-					_fx_flac_post_process_mid_side(c1, c2, blk_n);
-					break;
-				default:
-					break;
-			}
-
+      #if 0
 			/* Shift the output such that the resulting int32 stream can be
 			   played back. */
 			uint8_t shift = 32U - fh->sample_size;
@@ -1733,6 +1814,7 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 					}
 				}
 			}
+      #endif
 
 			/* We're done decoding this frame! Notify the outer loop! */
 			inst->blk_cur = 0U; /* Reset the read cursor */
@@ -1747,38 +1829,39 @@ static bool _fx_flac_process_in_frame(fx_flac_t *inst) {
 	return true;
 }
 
-static bool _fx_flac_process_decoded_frame(fx_flac_t *inst, int32_t *out,
+static bool _fx_flac_process_decoded_frame(fx_flac_t *inst, audio_t *out,
                                            uint32_t *out_len) {
 	/* Fetch the current stream and frame info. */
 	const fx_flac_frame_header_t *fh = inst->frame_header;
 
 	/* Fetch channel count and number of samples left to write */
-	const uint8_t cc = fh->channel_count;
-	uint32_t n_smpls_rem =
-	    (fh->block_size - inst->blk_cur - 1U) * cc + (cc - inst->chan_cur);
-
-	/* Truncate to the actually available space. */
+	const uint8_t cc = fh->channel_count; /* shall be 2 */
+   /* output always written as a pair - therefore even number - of frames */
+	uint32_t n_smpls_rem = (fh->block_size - inst->blk_cur) * cc;
+	/* Truncate to the actually available space. Make it even. */
 	if (n_smpls_rem > *out_len) {
-		n_smpls_rem = *out_len;
+		n_smpls_rem = *out_len & ~1U;
 	}
-
-	/* Interlace the decoded samples in the output array */
 	uint32_t tar = 0U; /* Number of samples written. */
+#if 0
 	while (tar < n_smpls_rem) {
 		/* Write to the output buffer */
-		out[tar] = inst->blkbuf[inst->chan_cur][inst->blk_cur];
-
-		/* Advance the read and write cursors */
-		inst->chan_cur++;
-		if (inst->chan_cur == cc) {
-			inst->chan_cur = 0U;
-			inst->blk_cur++;
-		}
-		tar++;
-	}
+		out[tar++] = ((audio_t*)(&inst->blkbuf[inst->blk_cur]))[0];
+		out[tar++] = ((audio_t*)(&inst->blkbuf[inst->blk_cur]))[1];
+      inst->blk_cur++;
+   }
 
 	/* Inform the caller about the number of samples written */
 	*out_len = tar;
+#else
+   int32_t _Alignas(4) *const _out = (int32_t*)out;
+	while (tar < n_smpls_rem >> 1) {
+		/* Write to the output buffer 2 samples at a time. */
+      _out[tar++] = inst->blkbuf[inst->blk_cur++];
+   }
+	/* Inform the caller about the number of samples written */
+	*out_len = tar << 1;
+#endif
 
 	/* We're done with this frame! */
 	if (inst->blk_cur == fh->block_size) {
@@ -1808,9 +1891,7 @@ uint32_t fx_flac_size(uint32_t max_block_size, uint8_t max_channels) {
 
 	/* Calculate the size of the structures depending on the given parameters.
 	 */
-	for (uint8_t i = 0; i < max_channels; i++) {
-		ok = ok && fx_mem_update_size(&size, sizeof(int32_t) * max_block_size);
-	}
+   ok = ok && fx_mem_update_size(&size, sizeof(int32_t) * max_block_size);
 	return ok ? size : 0;
 }
 
@@ -1844,14 +1925,9 @@ fx_flac_t *fx_flac_init(void *mem, uint16_t max_block_size,
 		    &mem, sizeof(fx_flac_subframe_header_t));
 		inst->qbuf = (int32_t *)fx_mem_align(&mem, sizeof(int32_t) * 32U);
 
-		/* Compute the addresses of the per-channel buffers */
-		for (uint8_t i = 0; i < FLAC_MAX_CHANNEL_COUNT; i++) {
-			inst->blkbuf[i] = NULL;
-		}
-		for (uint8_t i = 0; i < max_channels; i++) {
-			inst->blkbuf[i] =
-			    (int32_t *)fx_mem_align(&mem, sizeof(int32_t) * max_block_size);
-		}
+      /* we support only stereo and use a single buffer for both channels */
+      inst->blkbuf =
+          (int32_t *)fx_mem_align(&mem, sizeof(int32_t) * max_block_size);
 
 		/* Reset the instance, i.e. zero most/all fields. */
 		fx_flac_reset(inst);
@@ -1939,7 +2015,7 @@ int64_t fx_flac_get_streaminfo(fx_flac_t const *inst,
 }
 
 fx_flac_state_t fx_flac_process(fx_flac_t *inst, const uint8_t *in,
-                                uint32_t *in_len, int32_t *out,
+                                uint32_t *in_len, audio_t *out,
                                 uint32_t *out_len) {
 	inst = (fx_flac_t *)FX_ALIGN_ADDR(inst);
 

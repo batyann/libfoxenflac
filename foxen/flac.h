@@ -26,6 +26,7 @@
 
 #ifndef FOXEN_FLAC_H
 #define FOXEN_FLAC_H
+typedef int16_t audio_t;
 
 #include <stdint.h>
 
@@ -51,7 +52,7 @@ extern "C" {
 /**
  * Maximum number of channels that can be encoded in a FLAC stream.
  */
-#define FLAC_MAX_CHANNEL_COUNT 8U
+#define FLAC_MAX_CHANNEL_COUNT 2U
 
 /**
  * Maximum block size that can be used if the stream is encoded in the FLAC
@@ -288,7 +289,7 @@ FX_EXPORT int64_t fx_flac_get_streaminfo(const fx_flac_t *inst,
  * has been read.
  */
 FX_EXPORT fx_flac_state_t fx_flac_process(fx_flac_t *inst, const uint8_t *in,
-                                          uint32_t *in_len, int32_t *out,
+                                          uint32_t *in_len, audio_t *out,
                                           uint32_t *out_len);
 
 #ifdef __cplusplus
